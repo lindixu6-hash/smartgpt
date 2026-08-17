@@ -90,7 +90,9 @@ pub trait LLMModel : Send + Sync {
     fn get_token_limit(&self) -> usize;
 
     fn get_tokens_remaining(&self, text: &[Message]) -> Result<usize, Box<dyn Error>> {
-        Ok(self.get_token_limit() - self.get_token_count(text)?)
+        Ok(self
+            .get_token_limit()
+            .saturating_sub(self.get_token_count(text)?))
     }
 
     fn get_response_sync(&self, messages: &[Message], max_tokens: Option<u16>, temperature: Option<f32>) -> Result<String, Box<dyn Error>> {
@@ -199,4 +201,76 @@ pub fn format_prompt(messages: &[Message]) -> String {
     out.push_str("ASSISTANT: ");
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FixedTokenModel {
+        token_limit: usize,
+        tokens_per_message: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMModel for FixedTokenModel {
+        async fn get_response(
+            &self,
+            _messages: &[Message],
+            _max_tokens: Option<u16>,
+            _temperature: Option<f32>,
+        ) -> Result<String, Box<dyn Error>> {
+            Ok(String::new())
+        }
+
+        async fn get_base_embed(&self, _text: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+            Ok(vec![])
+        }
+
+        fn get_token_count(&self, messages: &[Message]) -> Result<usize, Box<dyn Error>> {
+            Ok(messages.len() * self.tokens_per_message)
+        }
+
+        fn get_token_limit(&self) -> usize {
+            self.token_limit
+        }
+
+        fn get_tokens_from_text(&self, _text: &str) -> Result<Vec<String>, Box<dyn Error>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn token_budget_saturates_when_context_exceeds_limit() {
+        let model = FixedTokenModel {
+            token_limit: 10,
+            tokens_per_message: 6,
+        };
+        let messages = vec![
+            Message::User("first".to_string()),
+            Message::Assistant("second".to_string()),
+        ];
+
+        assert_eq!(model.get_tokens_remaining(&messages).unwrap(), 0);
+    }
+
+    #[test]
+    fn crop_removes_history_until_requested_budget_is_available() {
+        let model = FixedTokenModel {
+            token_limit: 30,
+            tokens_per_message: 10,
+        };
+        let mut llm = LLM::new(Box::new(model));
+        llm.prompt.push(Message::System("system".to_string()));
+        llm.message_history = vec![
+            Message::User("first".to_string()),
+            Message::Assistant("second".to_string()),
+            Message::User("third".to_string()),
+        ];
+
+        llm.crop_to_tokens_remaining(10).unwrap();
+
+        assert_eq!(llm.message_history.len(), 1);
+        assert_eq!(llm.get_tokens_remaining(&llm.get_messages()).unwrap(), 10);
+    }
 }
